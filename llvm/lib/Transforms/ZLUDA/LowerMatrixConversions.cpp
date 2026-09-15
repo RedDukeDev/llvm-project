@@ -1,9 +1,12 @@
 #include "llvm/Transforms/ZLUDA/LowerMatrixConversions.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/Module.h"
+#include <array>
 #include <cstdlib>
+#include <optional>
 #include <utility>
 
 using namespace llvm;
@@ -205,6 +208,81 @@ static Value *bpermuteLane(IRBuilder<> &Builder, Value *Lane, Value *X,
   return Builder.CreateBitCast(Permuted, X->getType());
 }
 
+// Whether to move data between lanes with permlane16/permlanex16 instead of
+// ds_bpermute.
+//
+// ds_bpermute is a gather through local memory, and on the generic targets it
+// is 57% of the hottest kernel: 176
+// of them in every group call, with 78 s_waitcnt riding along. permlane16 and
+// permlanex16 are GFX10+ vector-unit permutations of a 16-lane row, taken from
+// the same row or from the other one, with packed 4-bit selectors that are
+// uniform across the wave and shared by both rows, as measured on the
+// hardware. Every conversion in this file moves
+// data along a map that depends on the lane alone, so each such map is at most
+// four permlanes and a per-lane select on a constant mask, and two when the
+// source depends on the column alone.
+//
+// On by default, measured in the real kernel -- a synthetic benchmark could not
+// tell the two apart, only the kernel knows what the memory round trips were
+// costing. gfx11-generic, alternated, same build for both: the hottest kernel
+// 71.4 -> 60.7 ms (-15%), the whole network 406 -> 381 ms (-6.2%), the output
+// image bit-identical in every run. ZLUDA_PERMLANE=0 turns it off. Not yet
+// measured on the fused native tiers (gfx1100/1101), RDNA2 or RDNA4.
+static bool permlaneRequested() {
+  static const bool on = [] {
+    const char *v = ::getenv("ZLUDA_PERMLANE");
+    return v == nullptr || v[0] != '0';
+  }();
+  return on;
+}
+
+// The value a lane expression takes in one concrete lane, or nothing if the
+// expression is not plain arithmetic over the lane number and constants.
+//
+// The conversions below build their source lane with IRBuilder from the lane
+// number, so evaluating that tree for lanes 0..31 recovers the fixed map the
+// ds_bpermute would have gathered along -- without restating the formulas a
+// second time, where they could drift from the ones that are actually emitted.
+static std::optional<uint32_t> evalLane(Value *V, Value *LaneID, uint32_t Lane,
+                                        unsigned Depth = 0) {
+  if (V == LaneID)
+    return Lane;
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return uint32_t(C->getZExtValue());
+  auto *BO = dyn_cast<BinaryOperator>(V);
+  if (!BO || Depth > 32)
+    return std::nullopt;
+  std::optional<uint32_t> L = evalLane(BO->getOperand(0), LaneID, Lane, Depth + 1);
+  std::optional<uint32_t> R = evalLane(BO->getOperand(1), LaneID, Lane, Depth + 1);
+  if (!L || !R)
+    return std::nullopt;
+  const uint32_t A = *L, B = *R;
+  switch (BO->getOpcode()) {
+  case Instruction::Add:
+    return A + B;
+  case Instruction::Sub:
+    return A - B;
+  case Instruction::Mul:
+    return A * B;
+  case Instruction::And:
+    return A & B;
+  case Instruction::Or:
+    return A | B;
+  case Instruction::Xor:
+    return A ^ B;
+  case Instruction::Shl:
+    if (B < 32)
+      return A << B;
+    return std::nullopt;
+  case Instruction::LShr:
+    if (B < 32)
+      return A >> B;
+    return std::nullopt;
+  default:
+    return std::nullopt;
+  }
+}
+
 class LowerMatrixConversions {
 public:
   LowerMatrixConversions(Function &F) : F(F), LaneID(nullptr) {}
@@ -224,9 +302,17 @@ private:
   Value *dMatrixSplit(IRBuilder<> &Builder, Value *AMDFragment, bool Truncate);
 
   Value *getLaneNumber();
+  // The value of X in the lane SrcLane names, for every lane: permlanes where
+  // the map is fixed and asked for, ds_bpermute otherwise.
+  Value *permuteLane(IRBuilder<> &Builder, Value *SrcLane, Value *X,
+                     const Twine &Name = "");
+  // An i1 that is bit `lane` of Mask, built once per function next to the
+  // lane number so every permlane select shares it.
+  Value *laneCondition(uint32_t Mask);
 
   Function &F;
   Value *LaneID;
+  DenseMap<uint32_t, Value *> LaneConditions;
 };
 
 Value *LowerMatrixConversions::getLaneNumber() {
@@ -238,6 +324,121 @@ Value *LowerMatrixConversions::getLaneNumber() {
   }
 
   return LaneID;
+}
+
+Value *LowerMatrixConversions::laneCondition(uint32_t Mask) {
+  auto It = LaneConditions.find(Mask);
+  if (It != LaneConditions.end())
+    return It->second;
+  auto *Lane = cast<Instruction>(getLaneNumber());
+  IRBuilder<> Builder(Lane->getNextNode());
+  Value *Bit = Builder.CreateAnd(Builder.CreateLShr(Builder.getInt32(Mask), Lane),
+                                 Builder.getInt32(1));
+  Value *Cond = Builder.CreateICmpNE(Bit, Builder.getInt32(0), "lane.cond");
+  LaneConditions[Mask] = Cond;
+  return Cond;
+}
+
+Value *LowerMatrixConversions::permuteLane(IRBuilder<> &Builder,
+                                           Value *SrcLane, Value *X,
+                                           const Twine &Name) {
+  if (isa<Constant>(X) || probeNoCrossLane() || !permlaneRequested())
+    return bpermuteLane(Builder, SrcLane, X, Name);
+
+  // The map this gather follows, lane by lane.
+  Value *Lane = getLaneNumber();
+  std::array<uint32_t, 32> Src;
+  for (uint32_t L = 0; L < 32; ++L) {
+    std::optional<uint32_t> S = evalLane(SrcLane, Lane, L);
+    if (!S || *S >= 32) {
+      // Which gathers stay on ds_bpermute, and why. Every map this file builds
+      // evaluates today, so this should stay silent; it is here so that a new
+      // conversion whose map does not will say so instead of quietly keeping
+      // its memory round trips.
+      if (::getenv("ZLUDA_PERMLANE_DEBUG")) {
+        errs() << "[permlane] keeping ds_bpermute in " << F.getName() << ": "
+               << (S ? "source lane out of range" : "map not evaluable")
+               << " (lane " << L << (S ? " -> " + std::to_string(*S) : "")
+               << ")\n  expression: " << *SrcLane << "\n";
+      }
+      return bpermuteLane(Builder, SrcLane, X, Name);
+    }
+    Src[L] = *S;
+  }
+
+  // Split it by kind: a lane reads either from its own row (permlane16) or
+  // from the other one (permlanex16), and each kind has one column selector
+  // per destination row. Indexed [cross][row][column].
+  uint32_t Sel[2][2][16] = {};
+  bool Used[2][2][16] = {};
+  bool KindUsed[2] = {};
+  bool RowUsed[2][2] = {};
+  uint32_t CrossMask = 0;
+  for (uint32_t L = 0; L < 32; ++L) {
+    const unsigned Row = L >> 4, Col = L & 15;
+    const unsigned Cross = (Src[L] >> 4) != Row;
+    Sel[Cross][Row][Col] = Src[L] & 15;
+    Used[Cross][Row][Col] = true;
+    KindUsed[Cross] = true;
+    RowUsed[Cross][Row] = true;
+    if (Cross)
+      CrossMask |= 1u << L;
+  }
+
+  Type *I32 = Builder.getInt32Ty();
+  Value *X32 = Builder.CreateBitCast(X, I32);
+
+  // One permlane of a kind. Row is 0 or 1 for that row's selectors, 2 for the
+  // two rows' selectors merged, which is only called when they do not clash.
+  auto EmitOne = [&](unsigned Cross, unsigned Row) -> Value * {
+    uint32_t Lo = 0, Hi = 0;
+    for (unsigned Col = 0; Col < 16; ++Col) {
+      bool In0 = Used[Cross][0][Col], In1 = Used[Cross][1][Col];
+      bool Use = Row == 2 ? (In0 || In1) : Used[Cross][Row][Col];
+      if (!Use)
+        continue;
+      uint32_t S = Row == 2 ? (In0 ? Sel[Cross][0][Col] : Sel[Cross][1][Col])
+                            : Sel[Cross][Row][Col];
+      if (Col < 8)
+        Lo |= S << (4 * Col);
+      else
+        Hi |= S << (4 * (Col - 8));
+    }
+    return Builder.CreateIntrinsic(
+        I32,
+        Cross ? Intrinsic::amdgcn_permlanex16 : Intrinsic::amdgcn_permlane16,
+        {PoisonValue::get(I32), X32, Builder.getInt32(Lo), Builder.getInt32(Hi),
+         Builder.getFalse(), Builder.getFalse()});
+  };
+
+  auto EmitKind = [&](unsigned Cross) -> Value * {
+    if (!KindUsed[Cross])
+      return nullptr;
+    if (!RowUsed[Cross][0])
+      return EmitOne(Cross, 1);
+    if (!RowUsed[Cross][1])
+      return EmitOne(Cross, 0);
+    bool Clash = false;
+    for (unsigned Col = 0; Col < 16; ++Col)
+      Clash |= Used[Cross][0][Col] && Used[Cross][1][Col] &&
+               Sel[Cross][0][Col] != Sel[Cross][1][Col];
+    if (!Clash)
+      return EmitOne(Cross, 2);
+    Value *Row0 = EmitOne(Cross, 0);
+    Value *Row1 = EmitOne(Cross, 1);
+    return Builder.CreateSelect(laneCondition(0xFFFF0000u), Row1, Row0);
+  };
+
+  Value *Same = EmitKind(0);
+  Value *Other = EmitKind(1);
+  Value *Result;
+  if (!Other)
+    Result = Same;
+  else if (!Same)
+    Result = Other;
+  else
+    Result = Builder.CreateSelect(laneCondition(CrossMask), Other, Same, Name);
+  return Builder.CreateBitCast(Result, X->getType());
 }
 
 Value *LowerMatrixConversions::aMatrixConvert(IRBuilder<> &Builder,
@@ -267,10 +468,10 @@ Value *LowerMatrixConversions::aMatrixConvert(IRBuilder<> &Builder,
         NVFragment, Builder.CreateAdd(BasePackedIdx, Builder.getInt32(1)));
 
     // a_tmp0 = bpermute_lane(cudaTID, reg0)
-    Value *ATmp0 = bpermuteLane(Builder, CudaTID, Reg0, "a.tmp0");
+    Value *ATmp0 = permuteLane(Builder, CudaTID, Reg0, "a.tmp0");
 
     // a_tmp1 = bpermute_lane(cudaTID, reg1)
-    Value *ATmp1 = bpermuteLane(Builder, CudaTID, Reg1, "a.tmp1");
+    Value *ATmp1 = permuteLane(Builder, CudaTID, Reg1, "a.tmp1");
 
     // a_Frag_reg = (lane < 8) ? a_tmp0 : a_tmp1
     Value *LaneMod16 = Builder.CreateAnd(Lane, 15, "lane.mod16");
@@ -307,8 +508,8 @@ Value *LowerMatrixConversions::aMatrixConvertI8Half(IRBuilder<> &Builder,
     Value *SrcThread =
         Builder.CreateAdd(Builder.CreateMul(QuarterLane, Builder.getInt32(4)),
                           Builder.getInt32(vGPR), "src.thread");
-    Value *APermutedLow = bpermuteLane(Builder, SrcThread, NvLowReg);
-    Value *APermutedHigh = bpermuteLane(Builder, SrcThread, NvHighReg);
+    Value *APermutedLow = permuteLane(Builder, SrcThread, NvLowReg);
+    Value *APermutedHigh = permuteLane(Builder, SrcThread, NvHighReg);
     Value *APermuted =
         Builder.CreateSelect(UsesLowSrc, APermutedLow, APermutedHigh);
     AMDFragment = Builder.CreateInsertElement(AMDFragment, APermuted, vGPR);
@@ -341,9 +542,9 @@ Value *LowerMatrixConversions::bMatrixConcatenate(IRBuilder<> &Builder,
 
     // b_Frag_reg = bpermute_lane(cudaTID, reg)
     Value *BFragRegFirst =
-        bpermuteLane(Builder, CudaTID, RegFirst, "b.frag.reg.first");
+        permuteLane(Builder, CudaTID, RegFirst, "b.frag.reg.first");
     Value *BFragRegSecond =
-        bpermuteLane(Builder, CudaTID, RegSecond, "b.frag.reg.second");
+        permuteLane(Builder, CudaTID, RegSecond, "b.frag.reg.second");
 
     // Extract bottom 16 bits
     Value *Bottom16First = Builder.CreateTrunc(
@@ -408,15 +609,15 @@ Value *LowerMatrixConversions::cMatrixConcatenate(IRBuilder<> &Builder,
 
     // ctmp0 = bpermute_lane(cudaTID, ...)
     Value *Ctmp0First =
-        bpermuteLane(Builder, CudaTID, Ctmp0SrcFirst, "ctmp0.first");
+        permuteLane(Builder, CudaTID, Ctmp0SrcFirst, "ctmp0.first");
     Value *Ctmp0Second =
-        bpermuteLane(Builder, CudaTID, Ctmp0SrcSecond, "ctmp0.second");
+        permuteLane(Builder, CudaTID, Ctmp0SrcSecond, "ctmp0.second");
 
     // ctmp1 = bpermute_lane(cudaTID, ...)
     Value *Ctmp1First =
-        bpermuteLane(Builder, CudaTID, Ctmp1SrcFirst, "ctmp1.first");
+        permuteLane(Builder, CudaTID, Ctmp1SrcFirst, "ctmp1.first");
     Value *Ctmp1Second =
-        bpermuteLane(Builder, CudaTID, Ctmp1SrcSecond, "ctmp1.second");
+        permuteLane(Builder, CudaTID, Ctmp1SrcSecond, "ctmp1.second");
 
     // cFrag[vGPR] = (lIdx & 1) ? ctmp1 : ctmp0
     Value *LaneIsOdd = Builder.CreateTrunc(Builder.CreateAnd(Lane, 1),
@@ -457,26 +658,26 @@ Value *LowerMatrixConversions::dMatrixSplit(IRBuilder<> &Builder,
 
     // d_tmp0 = bpermute_lane(r_lIdx, dFrag[baseVGPR])
     Value *DTmp0First =
-        bpermuteLane(Builder, R_lIdxFirst,
+        permuteLane(Builder, R_lIdxFirst,
                      Builder.CreateExtractElement(AMDFragment, BaseVGPRFirst),
                      "d.tmp0.first");
 
     // d_tmp1 = bpermute_lane(r_lIdx, dFrag[baseVGPR + 1])
-    Value *DTmp1First = bpermuteLane(
+    Value *DTmp1First = permuteLane(
         Builder, R_lIdxFirst,
         Builder.CreateExtractElement(
             AMDFragment, Builder.CreateAdd(BaseVGPRFirst, Builder.getInt32(1))),
         "d.tmp1.first");
 
     // d_tmp2 = bpermute_lane(r_lIdx, dFrag[baseVGPR + 2])
-    Value *DTmp2First = bpermuteLane(
+    Value *DTmp2First = permuteLane(
         Builder, R_lIdxFirst,
         Builder.CreateExtractElement(
             AMDFragment, Builder.CreateAdd(BaseVGPRFirst, Builder.getInt32(2))),
         "d.tmp2.first");
 
     // d_tmp3 = bpermute_lane(r_lIdx, dFrag[baseVGPR + 3])
-    Value *DTmp3First = bpermuteLane(
+    Value *DTmp3First = permuteLane(
         Builder, R_lIdxFirst,
         Builder.CreateExtractElement(
             AMDFragment, Builder.CreateAdd(BaseVGPRFirst, Builder.getInt32(3))),
@@ -529,26 +730,26 @@ Value *LowerMatrixConversions::dMatrixSplit(IRBuilder<> &Builder,
         AMDvGPRSecond, Builder.getInt32(~3), "base.vgpr.second");
 
     Value *DTmp0Second =
-        bpermuteLane(Builder, R_lIdxSecond,
+        permuteLane(Builder, R_lIdxSecond,
                      Builder.CreateExtractElement(AMDFragment, BaseVGPRSecond),
                      "d.tmp0.second");
 
     Value *DTmp1Second =
-        bpermuteLane(Builder, R_lIdxSecond,
+        permuteLane(Builder, R_lIdxSecond,
                      Builder.CreateExtractElement(
                          AMDFragment, Builder.CreateAdd(BaseVGPRSecond,
                                                         Builder.getInt32(1))),
                      "d.tmp1.second");
 
     Value *DTmp2Second =
-        bpermuteLane(Builder, R_lIdxSecond,
+        permuteLane(Builder, R_lIdxSecond,
                      Builder.CreateExtractElement(
                          AMDFragment, Builder.CreateAdd(BaseVGPRSecond,
                                                         Builder.getInt32(2))),
                      "d.tmp2.second");
 
     Value *DTmp3Second =
-        bpermuteLane(Builder, R_lIdxSecond,
+        permuteLane(Builder, R_lIdxSecond,
                      Builder.CreateExtractElement(
                          AMDFragment, Builder.CreateAdd(BaseVGPRSecond,
                                                         Builder.getInt32(3))),
