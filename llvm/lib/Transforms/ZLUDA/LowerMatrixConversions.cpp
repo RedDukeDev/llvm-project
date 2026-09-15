@@ -3,6 +3,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/Module.h"
+#include <cstdlib>
 #include <utility>
 
 using namespace llvm;
@@ -167,10 +168,32 @@ static IntrinsicInst *getMatrixConversion(Instruction &I) {
   return nullptr;
 }
 
+// Diagnostic: whether to skip the cross-lane move and hand back the lane's own
+// value.
+//
+// On the generic targets the FP8 path has been measured at 85% fragment
+// translation and 0% multiply, but "translation" is two things: widening e4m3
+// to f16, and moving data between lanes to turn NVIDIA's fragment layout into
+// AMD's. A static instruction count cannot tell them apart; this probe can.
+//
+// With the probe on, every ds_bpermute this file emits disappears along with
+// the lane arithmetic feeding it, while every extract, select and insert
+// around them stays exactly where it was. The image is meaningless by
+// construction; only the clock is read. The difference is what the cross-lane
+// traffic costs, and nothing else.
+static bool probeNoCrossLane() {
+  static const bool on = ::getenv("ZLUDA_PROBE_NO_CROSS_LANE") != nullptr;
+  return on;
+}
+
 static Value *bpermuteLane(IRBuilder<> &Builder, Value *Lane, Value *X,
                            const Twine &Name = "") {
   if (auto *C = dyn_cast<Constant>(X)) {
     return C;
+  }
+
+  if (probeNoCrossLane()) {
+    return X;
   }
 
   Value *BitCast = Builder.CreateBitCast(X, Builder.getInt32Ty());

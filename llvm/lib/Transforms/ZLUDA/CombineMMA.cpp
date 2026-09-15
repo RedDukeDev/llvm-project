@@ -6,6 +6,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
+#include <cstdlib>
 
 using namespace llvm;
 
@@ -91,6 +92,23 @@ static IntrinsicInst *getS8ZludaMMA(Instruction &I) {
     return MMA;
   }
   return nullptr;
+}
+
+// Diagnostic: whether to skip the real 16x16x16 tensor multiply and replace
+// it with a trivial reduction, keeping every conversion, concatenation and
+// split intrinsic around it untouched.
+//
+// Fusion halves the WMMA count and roughly halves the kernel time, which is
+// consistent with the WMMA being the cost -- but the fused kernel's
+// disassembly is dominated by ds_bpermute_b32 (9295 of them in the hottest
+// kernel), which is the layout glue this pass emits to turn two of NVIDIA's
+// 8-wide fragments into AMD's 16-wide one, not the multiply itself. This
+// answers which one actually owns the fused kernel's time: with the probe on,
+// every ds_bpermute this pass emits is still there and still executes: only
+// the tensor op inside it is gone.
+static bool probeNoRealWMMA() {
+  static const bool on = ::getenv("ZLUDA_PROBE_NO_REAL_WMMA") != nullptr;
+  return on;
 }
 
 class MMACombiner {
@@ -224,11 +242,25 @@ bool MMACombiner::combineMMA(IntrinsicInst *First, IntrinsicInst *Second) {
       AOperand = Builder.CreateBitCast(ShuffledA, V16F16Ty);
       BOperand = Builder.CreateBitCast(CombinedB, V16F16Ty);
     }
-    auto *Result = Builder.CreateIntrinsic(
-        V8F32Ty,
-        IsF16 ? Intrinsic::amdgcn_wmma_f32_16x16x16_f16
-              : Intrinsic::amdgcn_wmma_f32_16x16x16_bf16,
-        {AOperand, BOperand, CombinedCBitCast});
+    llvm::Value *Result;
+    if (probeNoRealWMMA()) {
+      // Same shape as the real op (<8 x float>), computed cheaply from the
+      // same operands so nothing upstream is dead-code-eliminated: every
+      // conversion and permute that feeds AOperand/BOperand still has to run.
+      auto V8F16Ty = VectorType::get(Builder.getHalfTy(), 8, /*Scalable=*/false);
+      auto ALo = Builder.CreateShuffleVector(AOperand, ArrayRef<int>{0, 1, 2, 3, 4, 5, 6, 7});
+      auto BLo = Builder.CreateShuffleVector(BOperand, ArrayRef<int>{0, 1, 2, 3, 4, 5, 6, 7});
+      auto Sum = Builder.CreateFAdd(Builder.CreateBitCast(ALo, V8F16Ty),
+                                    Builder.CreateBitCast(BLo, V8F16Ty));
+      auto SumF32 = Builder.CreateFPExt(Sum, VectorType::get(Builder.getFloatTy(), 8, false));
+      Result = Builder.CreateFAdd(SumF32, CombinedCBitCast);
+    } else {
+      Result = Builder.CreateIntrinsic(
+          V8F32Ty,
+          IsF16 ? Intrinsic::amdgcn_wmma_f32_16x16x16_f16
+                : Intrinsic::amdgcn_wmma_f32_16x16x16_bf16,
+          {AOperand, BOperand, CombinedCBitCast});
+    }
     auto *ResultBitCast = Builder.CreateBitCast(Result, V8I32Ty);
     Split = Builder.CreateIntrinsic(
         V4I32x2Ty, Intrinsic::zluda_dmatrix_split_nv16x8_amd16x16,
