@@ -1,5 +1,6 @@
 #include "llvm/Transforms/ZLUDA/CombineMMA.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -8,6 +9,7 @@
 #include "llvm/IR/FPEnv.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <cstdlib>
 #include <string>
 
@@ -241,6 +243,70 @@ static IntrinsicInst *getS8ZludaMMA(Instruction &I) {
   return nullptr;
 }
 
+// The mma intrinsic is wrapped in a noinline function so that ZLUDA's own
+// passes cannot fold it away. That wrapper also hides it from this pass: with
+// the wrapper standing, every basic block holds calls and no intrinsics, and
+// there is never a pair to fuse.
+//
+// Opening the wrapper at the source, by marking the call always_inline, does
+// make every multiply visible -- and costs more than the fusion returns. The
+// wrapper is a scheduling barrier as well as a hiding place: with it gone the
+// scheduler interleaves the multiplies and the live ranges grow. Measured on
+// cc_vit_1d_qkv_chained_fp8, which has no fusable pairs at all and so pays the
+// cost and collects none of the gain: 585 spilled registers became 2336, 1200
+// bytes of scratch became 4180, and the kernel went from 14.0 ms to 55.0 ms.
+// Across the whole network that was +85 ms against the -67 ms the fusion won
+// elsewhere.
+//
+// So the wrapper is opened here instead, and only where two calls in one block
+// share operand A -- which is to say only where this pass is about to fuse
+// them, and the barrier is paid for by a multiply that halves.
+static bool isMMAWrapper(const Function *F) {
+  if (!F || F->isDeclaration() || F->size() != 1) {
+    return false;
+  }
+  for (const Instruction &I : F->front()) {
+    const auto *Inner = dyn_cast<IntrinsicInst>(&I);
+    if (!Inner) {
+      continue;
+    }
+    switch (Inner->getIntrinsicID()) {
+    case Intrinsic::zluda_mma_m16n8k16_f32_f16_f16_f32:
+    case Intrinsic::zluda_mma_m16n8k16_f32_bf16_bf16_f32:
+    case Intrinsic::zluda_mma_m16n8k32_s32_s8_s8_s32:
+      return true;
+    default:
+      break;
+    }
+  }
+  return false;
+}
+
+// How many wrappers were opened, reported with the rest of the statistics.
+static unsigned Opened = 0;
+
+// Whether opening the wrapper is asked for. Set from the host by
+// zludaSetMMAOpen (>= 0 wins); otherwise the ZLUDA_MMA_OPEN environment
+// variable. The host setter exists because the selective build has to turn
+// fusion on and off between two compilations of the same module, and Rust's
+// std::env::set_var does not reach this getenv on Windows -- the C runtime
+// keeps its own copy of the environment.
+static int MMAOpenOverride = -1;
+static bool mmaOpenRequested() {
+  if (MMAOpenOverride >= 0) {
+    return MMAOpenOverride != 0;
+  }
+  return ::getenv("ZLUDA_MMA_OPEN") != nullptr;
+}
+
+extern "C" void zludaSetMMAOpen(int on) { MMAOpenOverride = on; }
+
+// The wrappers carry noinline only: the C++ marks them [[clang::optnone]], but
+// that attribute does not survive into the linked bitcode. The fragment
+// conversion inside a wrapper is therefore already fully optimised; making it
+// cheaper means emitting less of it (see LowerMatrixConversions), not letting
+// the optimiser at it.
+
 // Diagnostic: whether to skip the real 16x16x16 tensor multiply and replace
 // it with a trivial reduction, keeping every conversion, concatenation and
 // split intrinsic around it untouched.
@@ -258,6 +324,54 @@ static bool probeNoRealWMMA() {
   return on;
 }
 
+static bool openMMAWrappers(BasicBlock &BB) {
+  // Off unless asked for. Opening the wrapper is what lets this pass fuse at
+  // all, and on its own it costs more than it returns: the swin family gains
+  // 20% and the vit family loses three times that. The selective build turns
+  // it on only where it pays (see optimize_and_emit / selective_fuse_threshold
+  // in llvm_zluda), by building each module both ways and keeping the fused
+  // one only when its object did not balloon; the fusion itself is sound --
+  // 264 pairs of 264 in the hottest kernel.
+  if (!mmaOpenRequested()) {
+    return false;
+  }
+
+  // Group the wrapped multiplies by callee and by the A operand they are
+  // passed, which is the same key the fusion itself uses.
+  MapVector<std::pair<Function *, Value *>, SmallVector<CallInst *, 4>> Groups;
+  for (Instruction &I : BB) {
+    auto *Call = dyn_cast<CallInst>(&I);
+    if (!Call || Call->arg_size() < 1) {
+      continue;
+    }
+    Function *Callee = Call->getCalledFunction();
+    if (!isMMAWrapper(Callee)) {
+      continue;
+    }
+    Groups[{Callee, Call->getArgOperand(0)}].push_back(Call);
+  }
+
+  bool Modified = false;
+  for (auto &Group : Groups) {
+    // A group of one is left alone: opening it would pay the barrier and
+    // return nothing, which is exactly the trade that made the network slower.
+    if (Group.second.size() < 2) {
+      continue;
+    }
+    for (CallInst *Call : Group.second) {
+      InlineFunctionInfo IFI;
+      // The wrapper is one block, so this splices into the caller's block
+      // rather than splitting it -- which matters, because the fusion only
+      // pairs multiplies that end up in the same block.
+      if (InlineFunction(*Call, IFI).isSuccess()) {
+        Opened++;
+        Modified = true;
+      }
+    }
+  }
+  return Modified;
+}
+
 // Why multiplies were or were not fused, counted per function and printed when
 // ZLUDA_MMA_STATS is set.
 namespace {
@@ -270,7 +384,7 @@ struct CombineStats {
   unsigned ReorderFailed = 0; // it did not, because of a dependency
 
   void report(const Function &F) const {
-    if (!Seen || !::getenv("ZLUDA_MMA_STATS"))
+    if ((!Seen && !Opened) || !::getenv("ZLUDA_MMA_STATS"))
       return;
     errs() << "[zluda-combine-mma] " << F.getName() << ": " << Seen
            << " mma in " << Blocks << " blocks, " << Paired
@@ -278,7 +392,8 @@ struct CombineStats {
            << ReorderFailed << " refused), " << Alone
            << " alone in their block; refusals: " << RefusedByDependency
            << " dependency, " << RefusedByMemory << " memory; "
-           << "first blocker: " << FirstBlocker << "\n";
+           << "first blocker: " << FirstBlocker << "; " << Opened
+           << " wrappers opened\n";
   }
 };
 } // namespace
@@ -632,7 +747,9 @@ bool MMACombiner::combineBB(BasicBlock &BB) {
   // For now, we simply combine adjacent m16n8k16 MMAs if possible. This may be
   // good enough in most cases. Any MMAs that cannot be combined are lowered
   // individually.
-  bool Modified = false;
+  // The multiplies are hidden inside a noinline wrapper; the ones that have a
+  // partner here are brought into the open first, and only those.
+  bool Modified = openMMAWrappers(BB);
 
   SmallVector<IntrinsicInst *> MMAs;
 
