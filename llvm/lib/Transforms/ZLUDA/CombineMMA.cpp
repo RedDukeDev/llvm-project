@@ -11,6 +11,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 using namespace llvm;
@@ -96,8 +97,11 @@ static void noteBlocker(const Instruction &I) {
 // Moves the instructions that FromBefore depends on to before ToBefore. Does
 // nothing other than return false if FromBefore has a dependency on ToBefore,
 // and true otherwise. Based on LoadStoreVectorizer's reorder.
-static bool tryToReorderOperands(IntrinsicInst *FromBefore,
-                                 IntrinsicInst *ToBefore) {
+//
+// Takes plain instructions rather than intrinsics: pairMMAWrappers asks the
+// same question about two calls that combineMMA asks about two multiplies.
+static bool tryToReorderOperands(Instruction *FromBefore,
+                                 Instruction *ToBefore) {
   assert(FromBefore->getParent() == ToBefore->getParent());
 
   SmallPtrSet<Instruction *, 16> InstructionsToMove;
@@ -285,6 +289,9 @@ static bool isMMAWrapper(const Function *F) {
 // How many wrappers were opened, reported with the rest of the statistics.
 static unsigned Opened = 0;
 
+// Group calls built by pairMMAWrappers, reported with the rest.
+static unsigned PairsBuilt = 0;
+
 // Whether opening the wrapper is asked for. Set from the host by
 // zludaSetMMAOpen (>= 0 wins); otherwise the ZLUDA_MMA_OPEN environment
 // variable. The host setter exists because the selective build has to turn
@@ -372,6 +379,120 @@ static bool openMMAWrappers(BasicBlock &BB) {
   return Modified;
 }
 
+// Fusing without inlining: multiplies that share an A operand become one call
+// to a function that converts A once and multiplies several times.
+//
+// On the generic targets the cross-lane relayout of the fragments is 57% of the
+// hot kernel, measured by ablation, and much of it is spent more than once:
+// multiplies in that kernel share their A operand, and each call converts A for
+// itself because the calls sit behind separate invocations of the same noinline
+// wrapper, where nothing can see the duplication.
+//
+// Opening the wrappers (openMMAWrappers, above) does expose it, and the
+// existing fusion then removes it -- but it inlines 512 copies into the
+// caller, and the register pressure that follows is what makes fusion a loss
+// on a generic target, which gets 64 VGPRs where a native gfx1100 build gets
+// 96. This keeps the fusion and drops the inlining: the group function is
+// noinline, so the pressure lives in its short body rather than across the
+// caller's loop.
+//
+// On by default: on the generic target, at width two, the hot kernel goes
+// 79.9 -> 70.5 ms and the whole network 422 -> 399 ms, with the image identical
+// bit for bit and the object 0.5% larger. ZLUDA_MMA_PAIR=0 turns it off.
+//
+// It costs nothing where it does not apply: pairMMAWrappers hands the calls
+// back to fusion whenever fusion is driving the build, which is every native
+// tier.
+static bool mmaPairRequested() {
+  static const bool on = [] {
+    const char *Value = ::getenv("ZLUDA_MMA_PAIR");
+    return !Value || ::strcmp(Value, "0") != 0;
+  }();
+  return on;
+}
+
+// How many multiplies one group function takes.
+//
+// The hot kernel's 512 calls fall into only 80 groups sharing an A operand.
+// Taken two at a time, A is converted 256 times instead of 512; taken six at a
+// time, 80 times, because inside one function body the conversion intrinsic is
+// pure and identical and the optimiser folds the copies -- which it cannot do
+// across a call boundary. Against that, N accumulators and N B operands are
+// live at once inside the body, so register pressure grows with N.
+static unsigned mmaPairWidth() {
+  static const unsigned N = [] {
+    // Four, measured on the hot kernel: 79.8 ms with no grouping, 70.4 at two,
+    // 68.5 at four, and the smallest object (278 KB against 292 at two).
+    const char *Value = ::getenv("ZLUDA_MMA_PAIR_N");
+    if (!Value) {
+      return 4u;
+    }
+    const int Parsed = ::atoi(Value);
+    return Parsed >= 2 ? (unsigned)Parsed : 2u;
+  }();
+  return N;
+}
+
+// Builds {D1..DN} f(A, B1, C1, ..., BN, CN), with every multiply inlined into
+// it so the fusion that runs on it afterwards sees them as intrinsics.
+static Function *buildGroupFunction(Function *Wrapper, unsigned Width) {
+  LLVMContext &Ctx = Wrapper->getContext();
+  Type *ATy = Wrapper->getArg(0)->getType();
+  Type *BTy = Wrapper->getArg(1)->getType();
+  Type *CTy = Wrapper->getArg(2)->getType();
+  Type *RetTy = Wrapper->getReturnType();
+
+  SmallVector<Type *> Returns(Width, RetTy);
+  StructType *GroupTy = StructType::get(Ctx, Returns);
+
+  SmallVector<Type *> Params;
+  Params.push_back(ATy); // shared, which is the entire point
+  for (unsigned I = 0; I < Width; ++I) {
+    Params.push_back(BTy);
+    Params.push_back(CTy);
+  }
+
+  FunctionType *FT = FunctionType::get(GroupTy, Params, /*isVarArg=*/false);
+  Function *F = Function::Create(
+      FT, GlobalValue::InternalLinkage,
+      Wrapper->getName() + ".group" + Twine(Width), Wrapper->getParent());
+  // Convergent because what it wraps is: the multiply and the lane exchanges
+  // around it are wave-wide operations. noinline is the whole point.
+  F->addFnAttr(Attribute::Convergent);
+  F->addFnAttr(Attribute::NoInline);
+  F->setCallingConv(Wrapper->getCallingConv());
+
+  BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> Builder(BB);
+
+  SmallVector<CallInst *> Calls;
+  for (unsigned I = 0; I < Width; ++I) {
+    CallInst *Call = Builder.CreateCall(
+        Wrapper, {F->getArg(0), F->getArg(1 + 2 * I), F->getArg(2 + 2 * I)});
+    Call->setCallingConv(Wrapper->getCallingConv());
+    Calls.push_back(Call);
+  }
+
+  Value *Result = PoisonValue::get(GroupTy);
+  for (unsigned I = 0; I < Width; ++I) {
+    Result = Builder.CreateInsertValue(Result, Calls[I], {I});
+  }
+  Builder.CreateRet(Result);
+
+  // Inline them all, so what is left in this body is Width mma intrinsics in
+  // one block -- the shape the fusion already knows how to combine, and the
+  // shape in which the duplicate A conversions become visible to the
+  // optimiser.
+  for (CallInst *Call : Calls) {
+    InlineFunctionInfo IFI;
+    if (!InlineFunction(*Call, IFI).isSuccess()) {
+      F->eraseFromParent();
+      return nullptr;
+    }
+  }
+  return F;
+}
+
 // Why multiplies were or were not fused, counted per function and printed when
 // ZLUDA_MMA_STATS is set.
 namespace {
@@ -393,7 +514,7 @@ struct CombineStats {
            << " alone in their block; refusals: " << RefusedByDependency
            << " dependency, " << RefusedByMemory << " memory; "
            << "first blocker: " << FirstBlocker << "; " << Opened
-           << " wrappers opened\n";
+           << " wrappers opened; " << PairsBuilt << " group calls built\n";
   }
 };
 } // namespace
@@ -404,6 +525,7 @@ public:
 
 private:
   bool combineBB(BasicBlock &BB);
+  bool pairMMAWrappers(BasicBlock &BB);
   bool combineMMAs(SmallVectorImpl<IntrinsicInst *> &MMAs);
   bool combineMMA(IntrinsicInst *First, IntrinsicInst *Second);
 
@@ -743,13 +865,125 @@ bool MMACombiner::combineMMAs(SmallVectorImpl<IntrinsicInst *> &MMAs) {
   return Modified;
 }
 
+// Replaces groups of wrapper calls that share A with one call to a group
+// function, and fuses inside that function. See mmaPairRequested for why.
+bool MMACombiner::pairMMAWrappers(BasicBlock &BB) {
+  if (!mmaPairRequested()) {
+    return false;
+  }
+
+  if (mmaOpenRequested() || MMAOpenOverride >= 0) {
+    return false;
+  }
+
+  MapVector<std::pair<Function *, Value *>, SmallVector<CallInst *, 4>> Groups;
+  for (Instruction &I : BB) {
+    auto *Call = dyn_cast<CallInst>(&I);
+    if (!Call || Call->arg_size() != 3) {
+      continue;
+    }
+    Function *Callee = Call->getCalledFunction();
+    if (!isMMAWrapper(Callee)) {
+      continue;
+    }
+    Groups[{Callee, Call->getArgOperand(0)}].push_back(Call);
+  }
+
+  // One group function per wrapper and width, not one per group.
+  DenseMap<std::pair<Function *, unsigned>, Function *> PairFunctions;
+  bool Modified = false;
+
+  for (auto &Group : Groups) {
+    SmallVectorImpl<CallInst *> &Calls = Group.second;
+    // Widest first, then narrower on what is left over, rather than skipping a
+    // remainder that does not fill a whole group. Taking only exact multiples
+    // looks harmless and is not: at width six this kernel's groups -- six point
+    // four calls each on average -- leave more than half the calls untouched,
+    // and the object comes out larger than doing nothing. The remainder has to
+    // be swept up or the gain depends on the group sizes dividing evenly, which
+    // is a property of one network and not something to rely on.
+    const unsigned MaxWidth = mmaPairWidth();
+    size_t i = 0;
+    while (i + 2 <= Calls.size()) {
+      unsigned Width = (unsigned)std::min<size_t>(MaxWidth, Calls.size() - i);
+      CallInst *First = Calls[i];
+      // Everything the later calls need has to be computable where the first
+      // one sits, since that is where the single call replacing them all goes.
+      // Asked one at a time so a refusal costs only that group, and asked in
+      // order so each move sees the ones before it.
+      bool Reordered = true;
+      for (unsigned J = 1; J < Width && Reordered; ++J) {
+        CallInst *Later = Calls[i + J];
+        Reordered = First->comesBefore(Later) &&
+                    tryToReorderOperands(Later, First);
+      }
+      if (!Reordered) {
+        // Past this one only: a refusal here says nothing about a group
+        // starting at the next call.
+        ++i;
+        continue;
+      }
+
+      Function *Wrapper = Group.first.first;
+      // One function per wrapper and width, since the remainder is narrower
+      // than the rest and needs a shape of its own.
+      Function *&PairF = PairFunctions[{Wrapper, Width}];
+      if (!PairF) {
+        PairF = buildGroupFunction(Wrapper, Width);
+        if (!PairF) {
+          ++i;
+          continue;
+        }
+        // The pass will not visit a function created while it is running, so
+        // the fusion inside the new body has to be asked for here. A fresh
+        // combiner: this one's own bookkeeping belongs to the function it was
+        // started on.
+        MMACombiner Inner;
+        Inner.combine(*PairF);
+      }
+
+      IRBuilder<> Builder(First);
+      SmallVector<Value *> Args;
+      Args.push_back(First->getArgOperand(0)); // the shared A
+      for (unsigned J = 0; J < Width; ++J) {
+        Args.push_back(Calls[i + J]->getArgOperand(1));
+        Args.push_back(Calls[i + J]->getArgOperand(2));
+      }
+      CallInst *PairCall = Builder.CreateCall(PairF, Args);
+      PairCall->setCallingConv(PairF->getCallingConv());
+
+      // Every result is defined before any of the calls it replaces, so no use
+      // of any of them -- wherever it sits -- reads something not yet there.
+      SmallVector<Value *> Results;
+      for (unsigned J = 0; J < Width; ++J) {
+        Results.push_back(Builder.CreateExtractValue(PairCall, {J}));
+      }
+      for (unsigned J = 0; J < Width; ++J) {
+        Calls[i + J]->replaceAllUsesWith(Results[J]);
+      }
+      // Last to first: erasing in reverse keeps the earlier ones valid while
+      // the later ones go.
+      for (unsigned J = Width; J-- > 0;) {
+        Calls[i + J]->eraseFromParent();
+      }
+      PairsBuilt++;
+      Modified = true;
+      i += Width;
+    }
+  }
+  return Modified;
+}
+
 bool MMACombiner::combineBB(BasicBlock &BB) {
   // For now, we simply combine adjacent m16n8k16 MMAs if possible. This may be
   // good enough in most cases. Any MMAs that cannot be combined are lowered
   // individually.
   // The multiplies are hidden inside a noinline wrapper; the ones that have a
-  // partner here are brought into the open first, and only those.
-  bool Modified = openMMAWrappers(BB);
+  // partner here are brought into the open first, and only those. Grouping
+  // comes first: it consumes the calls that opening would otherwise inline,
+  // and the two are alternatives, not stages.
+  bool Modified = pairMMAWrappers(BB);
+  Modified |= openMMAWrappers(BB);
 
   SmallVector<IntrinsicInst *> MMAs;
 
