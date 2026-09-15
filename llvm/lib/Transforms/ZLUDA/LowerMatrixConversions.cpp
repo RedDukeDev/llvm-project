@@ -165,6 +165,10 @@ static IntrinsicInst *getMatrixConversion(Instruction &I) {
     case Intrinsic::zluda_dmatrix_split_nv16x8_amd16x16:
     case Intrinsic::zluda_amatrix_split_amd16x16_nv16x32:
     case Intrinsic::zluda_bmatrix_reshape_amd16x16_nv32x8:
+    case Intrinsic::zluda_amatrix_convert_fp8_amd16x16_nv16x32:
+    case Intrinsic::zluda_bmatrix_convert_fp8_amd16x16_nv32x8:
+    case Intrinsic::zluda_cmatrix_concatenate_fp8_amd16x16_nv16x8:
+    case Intrinsic::zluda_dmatrix_split_fp8_nv16x8_amd16x16:
       return II;
     }
   }
@@ -300,6 +304,17 @@ private:
   Value *cMatrixConcatenate(IRBuilder<> &Builder, Value *NVFragmentFirst,
                             Value *NVFragmentSecond);
   Value *dMatrixSplit(IRBuilder<> &Builder, Value *AMDFragment, bool Truncate);
+
+  // GFX12 FP8: a full parallel set, laid out for the derivation in one place.
+  // See the comment on the intrinsics themselves (IntrinsicsZLUDA.td) for why
+  // none of the functions above carry over.
+  Value *aMatrixConvertFp8Half(IRBuilder<> &Builder, Value *NvLowReg,
+                               Value *NvHighReg);
+  Value *bMatrixConvertFp8Half(IRBuilder<> &Builder, Value *NvRegLeft,
+                               Value *NvRegRight);
+  Value *cMatrixConcatenateFp8(IRBuilder<> &Builder, Value *NVFragmentFirst,
+                               Value *NVFragmentSecond);
+  Value *dMatrixSplitFp8(IRBuilder<> &Builder, Value *AMDFragment);
 
   Value *getLaneNumber();
   // The value of X in the lane SrcLane names, for every lane: permlanes where
@@ -782,6 +797,176 @@ Value *LowerMatrixConversions::dMatrixSplit(IRBuilder<> &Builder,
   return Result;
 }
 
+// GFX12 FP8 matrix conversions.
+//
+// Derived, not guessed: from NVIDIA's PTX ISA guide (8.8), section
+// 9.7.14.5.10 "Matrix Fragments for mma.m16n8k32", .e4m3 row/col:
+//
+//   groupID = %laneid >> 2;  threadID_in_group = %laneid % 4;
+//   A: row = groupID for 0<=i<4 || 8<=i<12, else groupID+8
+//      col = threadID_in_group*4 + (i&3) [+16 for i>=8]
+//   B: row (=K) = threadID_in_group*4 + (i&3) [+16 for i>=4]; col = groupID
+//   C/D: row = groupID for i<2, groupID+8 for i>=2
+//        col = threadID_in_group*2 + (i&1)
+//
+// and from the AMD Matrix Instruction Calculator
+// (github.com/ROCm/amd_matrix_instruction_calculator), RDNA4,
+// v_wmma_f32_16x16x16_fp8_fp8, wave32, no modifiers:
+//
+//   A[i][k] GPR: (k/4)%2, byte (k%4);  Lane: 16*(k/8) + i
+//   B[k][j] GPR: (k/4)%2, byte (k%4);  Lane: 16*(k/8) + j
+//   C/D[i][j] GPR: i%8;  Lane: 16*(i/8) + j
+//
+// Working through both sides -- who is a function of AMD's own (lane, GPR)
+// coordinates for a fixed K-half -- gives, for every one of A, B, C and D, a
+// formula built from the same two pieces: which of two NVIDIA registers to
+// read (a coarse selector, exactly the role zluda_amatrix_convert_amd_nv16x16
+// and the I8 conversions above already play), and a source lane computed as
+// group*4 + tid where group and tid come from AMD's own row/col mod 8 and
+// div/mod 2. None of it reuses the GFX11 functions above: RDNA4's operand
+// width is half RDNA3's for 8-bit types, its K-lane split is a different
+// scheme (two lane-halves carrying different K, not the same K broadcast
+// twice), and even the accumulator's GPR/lane formula differs.
+//
+// Unverified on hardware: the compiler accepting the intrinsic and selecting
+// real instructions for it does not by itself prove the layout right.
+
+Value *LowerMatrixConversions::aMatrixConvertFp8Half(IRBuilder<> &Builder,
+                                                     Value *NvLowReg,
+                                                     Value *NvHighReg) {
+  Value *Lane = getLaneNumber();
+  Value *Row = Builder.CreateAnd(Lane, 15, "row");        // i = lane % 16
+  Value *Half = Builder.CreateLShr(Lane, 4, "half");      // 0 for lane<16, 1 otherwise
+  Value *GroupID = Builder.CreateAnd(Row, 7, "group.id"); // row % 8, either branch
+  Value *UsesLow =
+      Builder.CreateICmpULT(Row, Builder.getInt32(8), "uses.low");
+
+  Value *AMDFragment = PoisonValue::get(
+      VectorType::get(Builder.getInt32Ty(), 2, /*Scalable=*/false));
+  for (uint32_t GPR = 0; GPR < 2; ++GPR) {
+    Value *Tid = Builder.CreateAdd(
+        Builder.CreateMul(Half, Builder.getInt32(2)), Builder.getInt32(GPR));
+    Value *SrcThread = Builder.CreateAdd(
+        Builder.CreateMul(GroupID, Builder.getInt32(4)), Tid, "src.thread");
+    Value *PermLow = permuteLane(Builder, SrcThread, NvLowReg);
+    Value *PermHigh = permuteLane(Builder, SrcThread, NvHighReg);
+    Value *Permuted = Builder.CreateSelect(UsesLow, PermLow, PermHigh);
+    AMDFragment = Builder.CreateInsertElement(AMDFragment, Permuted, GPR);
+  }
+  return AMDFragment;
+}
+
+Value *LowerMatrixConversions::bMatrixConvertFp8Half(IRBuilder<> &Builder,
+                                                     Value *NvRegLeft,
+                                                     Value *NvRegRight) {
+  Value *Lane = getLaneNumber();
+  Value *Col = Builder.CreateAnd(Lane, 15, "col");        // j = lane % 16
+  Value *Half = Builder.CreateLShr(Lane, 4, "half");
+  Value *GroupID = Builder.CreateAnd(Col, 7, "group.id"); // col % 8, either branch
+  Value *UsesLeft =
+      Builder.CreateICmpULT(Col, Builder.getInt32(8), "uses.left");
+
+  Value *AMDFragment = PoisonValue::get(
+      VectorType::get(Builder.getInt32Ty(), 2, /*Scalable=*/false));
+  for (uint32_t GPR = 0; GPR < 2; ++GPR) {
+    Value *Tid = Builder.CreateAdd(
+        Builder.CreateMul(Half, Builder.getInt32(2)), Builder.getInt32(GPR));
+    Value *SrcThread = Builder.CreateAdd(
+        Builder.CreateMul(GroupID, Builder.getInt32(4)), Tid, "src.thread");
+    Value *PermLeft = permuteLane(Builder, SrcThread, NvRegLeft);
+    Value *PermRight = permuteLane(Builder, SrcThread, NvRegRight);
+    Value *Permuted = Builder.CreateSelect(UsesLeft, PermLeft, PermRight);
+    AMDFragment = Builder.CreateInsertElement(AMDFragment, Permuted, GPR);
+  }
+  return AMDFragment;
+}
+
+Value *LowerMatrixConversions::cMatrixConcatenateFp8(IRBuilder<> &Builder,
+                                                     Value *NVFragmentFirst,
+                                                     Value *NVFragmentSecond) {
+  auto *RetTy = VectorType::get(Builder.getInt32Ty(), 8, /*Scalable=*/false);
+  if (Constant *C0 = dyn_cast<Constant>(NVFragmentFirst)) {
+    if (Constant *C1 = dyn_cast<Constant>(NVFragmentSecond)) {
+      if (C0->isZeroValue() && C1->isZeroValue()) {
+        return Constant::getNullValue(RetTy);
+      }
+    }
+  }
+
+  Value *Lane = getLaneNumber();
+  Value *Col = Builder.CreateAnd(Lane, 15, "col");   // j = lane % 16
+  Value *Half = Builder.CreateLShr(Lane, 4, "half"); // 0 for lane<16, 1 otherwise
+  // Local column within whichever 8-wide NVIDIA fragment this lane draws
+  // from: identical to Col when j<8 (First), and Col-8 when j>=8 (Second) --
+  // both cases collapse to the same "& 7", which is what lets First and
+  // Second share one formula below.
+  Value *LocalCol = Builder.CreateAnd(Col, 7, "local.col");
+  Value *UsesFirst =
+      Builder.CreateICmpULT(Col, Builder.getInt32(8), "uses.first");
+  Value *RegIdx = Builder.CreateAdd(
+      Builder.CreateMul(Half, Builder.getInt32(2)),
+      Builder.CreateAnd(LocalCol, 1), "reg.idx");
+  Value *Tid = Builder.CreateLShr(LocalCol, 1, "tid");
+
+  Value *AMDFragment = PoisonValue::get(RetTy);
+  for (uint32_t GPR = 0; GPR < 8; ++GPR) {
+    Value *SrcThread = Builder.CreateAdd(
+        Builder.getInt32(GPR * 4), Tid, "src.thread");
+    Value *RegFirst = Builder.CreateExtractElement(NVFragmentFirst, RegIdx);
+    Value *RegSecond = Builder.CreateExtractElement(NVFragmentSecond, RegIdx);
+    Value *PermFirst = permuteLane(Builder, SrcThread, RegFirst);
+    Value *PermSecond = permuteLane(Builder, SrcThread, RegSecond);
+    Value *Value_ = Builder.CreateSelect(UsesFirst, PermFirst, PermSecond);
+    AMDFragment = Builder.CreateInsertElement(AMDFragment, Value_, GPR);
+  }
+  return AMDFragment;
+}
+
+Value *LowerMatrixConversions::dMatrixSplitFp8(IRBuilder<> &Builder,
+                                              Value *AMDFragment) {
+  // The inverse of cMatrixConcatenateFp8: this lane speaks for an NVIDIA
+  // (row, register) pair rather than an AMD (lane, GPR) pair, so groupID/tid
+  // come from this lane directly, and row/g/half are derived rather than
+  // given.
+  Value *Lane = getLaneNumber();
+  Value *GroupID = Builder.CreateLShr(Lane, 2, "group.id"); // laneid / 4
+  Value *Tid = Builder.CreateAnd(Lane, 3, "tid");           // laneid % 4
+
+  Type *V4I32Ty = VectorType::get(Builder.getInt32Ty(), 4, /*Scalable=*/false);
+  Value *First = PoisonValue::get(V4I32Ty);
+  Value *Second = PoisonValue::get(V4I32Ty);
+  for (uint32_t r = 0; r < 4; ++r) {
+    // row = groupID for r<2, groupID+8 for r>=2; g = row%8 = groupID always
+    // (groupID<8 by construction); half = row/8 = (r>=2) ? 1 : 0.
+    Value *Row = (r < 2) ? GroupID
+                         : Builder.CreateAdd(GroupID, Builder.getInt32(8));
+    Value *GPR = GroupID; // row % 8
+    Value *Half = Builder.getInt32(r < 2 ? 0 : 1);
+    // localCol = tid*2 + (r&1)
+    Value *LocalCol = Builder.CreateAdd(
+        Builder.CreateMul(Tid, Builder.getInt32(2)),
+        Builder.getInt32(r & 1), "local.col");
+    Value *SrcLaneFirst = Builder.CreateAdd(
+        Builder.CreateMul(Half, Builder.getInt32(16)), LocalCol,
+        "src.lane.first");
+    Value *SrcLaneSecond = Builder.CreateAdd(
+        SrcLaneFirst, Builder.getInt32(8), "src.lane.second");
+
+    Value *RegVal = Builder.CreateExtractElement(AMDFragment, GPR);
+    Value *ValFirst = permuteLane(Builder, SrcLaneFirst, RegVal);
+    Value *ValSecond = permuteLane(Builder, SrcLaneSecond, RegVal);
+    First = Builder.CreateInsertElement(First, ValFirst, r);
+    Second = Builder.CreateInsertElement(Second, ValSecond, r);
+    (void)Row; // kept for the derivation's sake; folded into GPR/Half above
+  }
+
+  Type *ReturnTy = StructType::get(V4I32Ty, V4I32Ty);
+  Value *Result = PoisonValue::get(ReturnTy);
+  Result = Builder.CreateInsertValue(Result, First, 0);
+  Result = Builder.CreateInsertValue(Result, Second, 1);
+  return Result;
+}
+
 void LowerMatrixConversions::lowerConversion(IntrinsicInst *Conversion) {
   IRBuilder<> Builder(Conversion);
 
@@ -860,6 +1045,60 @@ void LowerMatrixConversions::lowerConversion(IntrinsicInst *Conversion) {
     Result = Builder.CreateInsertValue(Result, B0, 0);
     Result = Builder.CreateInsertValue(Result, B1, 1);
     Conversion->replaceAllUsesWith(Result);
+    Conversion->eraseFromParent();
+    break;
+  }
+  case Intrinsic::zluda_amatrix_convert_fp8_amd16x16_nv16x32: {
+    Value *NVMatrix = Conversion->getArgOperand(0);
+    auto *V0 = Builder.CreateExtractElement(NVMatrix, uint64_t(0));
+    auto *V1 = Builder.CreateExtractElement(NVMatrix, uint64_t(1));
+    auto *V2 = Builder.CreateExtractElement(NVMatrix, uint64_t(2));
+    auto *V3 = Builder.CreateExtractElement(NVMatrix, uint64_t(3));
+    auto LowHalf = aMatrixConvertFp8Half(Builder, V0, V1);
+    auto HighHalf = aMatrixConvertFp8Half(Builder, V2, V3);
+    Type *ReturnTy = StructType::get(LowHalf->getType(), HighHalf->getType());
+    Value *Result = PoisonValue::get(ReturnTy);
+    Result = Builder.CreateInsertValue(Result, LowHalf, 0);
+    Result = Builder.CreateInsertValue(Result, HighHalf, 1);
+    Conversion->replaceAllUsesWith(Result);
+    Conversion->eraseFromParent();
+    break;
+  }
+  case Intrinsic::zluda_bmatrix_convert_fp8_amd16x16_nv32x8: {
+    Value *LeftNVMatrix = Conversion->getArgOperand(0);
+    Value *RightNVMatrix = Conversion->getArgOperand(1);
+    Value *UpperLeftMatrix =
+        Builder.CreateExtractElement(LeftNVMatrix, uint64_t(0));
+    Value *UpperRightMatrix =
+        Builder.CreateExtractElement(RightNVMatrix, uint64_t(0));
+    Value *LowerLeftMatrix =
+        Builder.CreateExtractElement(LeftNVMatrix, uint64_t(1));
+    Value *LowerRightMatrix =
+        Builder.CreateExtractElement(RightNVMatrix, uint64_t(1));
+    Value *B0 =
+        bMatrixConvertFp8Half(Builder, UpperLeftMatrix, UpperRightMatrix);
+    Value *B1 =
+        bMatrixConvertFp8Half(Builder, LowerLeftMatrix, LowerRightMatrix);
+    Type *ReturnTy = StructType::get(B0->getType(), B1->getType());
+    Value *Result = PoisonValue::get(ReturnTy);
+    Result = Builder.CreateInsertValue(Result, B0, 0);
+    Result = Builder.CreateInsertValue(Result, B1, 1);
+    Conversion->replaceAllUsesWith(Result);
+    Conversion->eraseFromParent();
+    break;
+  }
+  case Intrinsic::zluda_cmatrix_concatenate_fp8_amd16x16_nv16x8: {
+    Value *NVFragmentFirst = Conversion->getArgOperand(0);
+    Value *NVFragmentSecond = Conversion->getArgOperand(1);
+    Value *Result =
+        cMatrixConcatenateFp8(Builder, NVFragmentFirst, NVFragmentSecond);
+    Conversion->replaceAllUsesWith(Result);
+    Conversion->eraseFromParent();
+    break;
+  }
+  case Intrinsic::zluda_dmatrix_split_fp8_nv16x8_amd16x16: {
+    Value *AMDMatrix = Conversion->getArgOperand(0);
+    Conversion->replaceAllUsesWith(dMatrixSplitFp8(Builder, AMDMatrix));
     Conversion->eraseFromParent();
     break;
   }

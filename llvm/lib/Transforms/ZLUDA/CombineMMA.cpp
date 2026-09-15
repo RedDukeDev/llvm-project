@@ -247,6 +247,18 @@ static IntrinsicInst *getS8ZludaMMA(Instruction &I) {
   return nullptr;
 }
 
+// Same PTX shape as s8 (m16n8k32, 8-bit elements), native on gfx12 only --
+// gfx11 never reaches this intrinsic, since the HIP source only emits it when
+// __oclc_ISA_version >= 12000.
+static IntrinsicInst *getFp8ZludaMMA(Instruction &I) {
+  auto *MMA = dyn_cast<IntrinsicInst>(&I);
+  if (MMA && MMA->getIntrinsicID() ==
+                 Intrinsic::zluda_mma_m16n8k32_f32_fp8_fp8_f32) {
+    return MMA;
+  }
+  return nullptr;
+}
+
 // The mma intrinsic is wrapped in a noinline function so that ZLUDA's own
 // passes cannot fold it away. That wrapper also hides it from this pass: with
 // the wrapper standing, every basic block holds calls and no intrinsics, and
@@ -278,6 +290,7 @@ static bool isMMAWrapper(const Function *F) {
     case Intrinsic::zluda_mma_m16n8k16_f32_f16_f16_f32:
     case Intrinsic::zluda_mma_m16n8k16_f32_bf16_bf16_f32:
     case Intrinsic::zluda_mma_m16n8k32_s32_s8_s8_s32:
+    case Intrinsic::zluda_mma_m16n8k32_f32_fp8_fp8_f32:
       return true;
     default:
       break;
@@ -532,10 +545,14 @@ private:
   llvm::Value *EmitAmdMmaI8(llvm::IRBuilder<> &Builder, llvm::Value *FirstA,
                             llvm::Value *FirstB, llvm::Value *SecondB,
                             llvm::Value *FirstC, llvm::Value *SecondC);
+  llvm::Value *EmitAmdMmaFp8(llvm::IRBuilder<> &Builder, llvm::Value *FirstA,
+                             llvm::Value *FirstB, llvm::Value *SecondB,
+                             llvm::Value *FirstC, llvm::Value *SecondC);
 
   void lowerMMA(IntrinsicInst *MMA);
 
   Value *combineC(IRBuilder<> &Builder, Value *FirstC, Value *SecondC);
+  Value *combineCFp8(IRBuilder<> &Builder, Value *FirstC, Value *SecondC);
   Value *convertC(IRBuilder<> &Builder, Value *C);
 
   SmallVector<Instruction *> MaybeRemove;
@@ -613,6 +630,39 @@ Value *MMACombiner::convertC(IRBuilder<> &Builder, Value *C) {
   auto IntResult = Builder.CreateIntrinsic(
       V8I32Ty, Intrinsic::zluda_cmatrix_concatenate_amd16x16_nv16x8, {C, NullC});
   return Builder.CreateBitCast(IntResult, V8F32Ty);
+}
+
+// The FP8/GFX12 analogue of combineC: same "reuse a prior split rather than
+// concatenate and immediately re-split" shortcut, aimed at the GFX12-specific
+// split/concatenate pair instead of the GFX11 one.
+Value *MMACombiner::combineCFp8(IRBuilder<> &Builder, Value *FirstC,
+                                Value *SecondC) {
+  auto *FirstExtract = dyn_cast<ExtractValueInst>(FirstC);
+  auto *SecondExtract = dyn_cast<ExtractValueInst>(SecondC);
+  if (FirstExtract != nullptr && SecondExtract != nullptr) {
+    auto *FirstAggregate = FirstExtract->getAggregateOperand();
+    auto FirstIndices = FirstExtract->getIndices();
+    auto *SecondAggregate = SecondExtract->getAggregateOperand();
+    auto SecondIndices = SecondExtract->getIndices();
+    if (FirstAggregate == SecondAggregate &&
+        FirstIndices == ArrayRef<unsigned>{0} &&
+        SecondIndices == ArrayRef<unsigned>{1}) {
+      if (auto *II = dyn_cast<IntrinsicInst>(FirstAggregate)) {
+        if (II->getIntrinsicID() ==
+            Intrinsic::zluda_dmatrix_split_fp8_nv16x8_amd16x16) {
+          MaybeRemove.emplace_back(FirstExtract);
+          MaybeRemove.emplace_back(SecondExtract);
+          MaybeRemove.emplace_back(II);
+          return II->getArgOperand(0);
+        }
+      }
+    }
+  }
+
+  auto V8I32Ty = VectorType::get(Builder.getInt32Ty(), 8, /*Scalable=*/false);
+  return Builder.CreateIntrinsic(
+      V8I32Ty, Intrinsic::zluda_cmatrix_concatenate_fp8_amd16x16_nv16x8,
+      {FirstC, SecondC});
 }
 
 // Whether the fused instruction can be built where the second multiply sits
@@ -725,6 +775,9 @@ bool MMACombiner::combineMMA(IntrinsicInst *First, IntrinsicInst *Second) {
   } else if (First->getIntrinsicID() ==
              Intrinsic::zluda_mma_m16n8k32_s32_s8_s8_s32) {
     Split = EmitAmdMmaI8(Builder, FirstA, FirstB, SecondB, FirstC, SecondC);
+  } else if (First->getIntrinsicID() ==
+             Intrinsic::zluda_mma_m16n8k32_f32_fp8_fp8_f32) {
+    Split = EmitAmdMmaFp8(Builder, FirstA, FirstB, SecondB, FirstC, SecondC);
   } else {
     llvm_unreachable("Unsupported MMA intrinsic");
   }
@@ -775,6 +828,59 @@ llvm::Value *MMACombiner::EmitAmdMmaI8(llvm::IRBuilder<> &Builder,
       V4I32x2Ty, Intrinsic::zluda_dmatrix_split_nv16x8_amd16x16, {D});
 }
 
+// Same structure as EmitAmdMmaI8 -- gfx12's fp8_fp8 WMMA shares the s8
+// (iu8) WMMA's exact operand profile, [v8f32/v8i32, v2i32, v2i32,
+// v8f32/v8i32]: A and B are 2 x i32 per lane either way, and AMD's own
+// documentation states the operand layout is unified across the 8-bit-element
+// WMMA family (int8, int4, and by the same construction fp8). The one
+// difference is the accumulator: f32 rather than s32, and the WMMA has no
+// sign-of-A/sign-of-B/clamp operands the way iu8 does -- fp8 is not signed or
+// unsigned, it names its own format, so the call takes exactly A, B, C.
+//
+// The K=32 -> two K=16 AMD ops split (SplitA/ReshapedB, unchanged from the s8
+// case) and the N=8 -> N=16 fusion (FirstB/SecondB, real when fused, zero
+// when not) are both reused verbatim: they move bytes between lanes without
+// regard to what the bytes mean, which is exactly why the s8 infrastructure
+// carries over rather than needing its own.
+llvm::Value *MMACombiner::EmitAmdMmaFp8(llvm::IRBuilder<> &Builder,
+                                        llvm::Value *A, llvm::Value *FirstB,
+                                        llvm::Value *SecondB,
+                                        llvm::Value *FirstC,
+                                        llvm::Value *SecondC) {
+  auto V2I32Ty = VectorType::get(Builder.getInt32Ty(), 2, /*Scalable=*/false);
+  auto V2I32x2Ty = StructType::get(Builder.getContext(), {V2I32Ty, V2I32Ty});
+  auto V4I32Ty = VectorType::get(Builder.getInt32Ty(), 4, /*Scalable=*/false);
+  auto V4I32x2Ty = StructType::get(Builder.getContext(), {V4I32Ty, V4I32Ty});
+  auto V8I32Ty = VectorType::get(Builder.getInt32Ty(), 8, /*Scalable=*/false);
+  auto V8F32Ty = VectorType::get(Builder.getFloatTy(), 8, /*Scalable=*/false);
+
+  // GFX12's own conversions: see the derivation comment above
+  // aMatrixConvertFp8Half in LowerMatrixConversions.cpp. Not the GFX11 ones
+  // above -- the operand width and lane layout genuinely differ between the
+  // two generations for every one of A, B and the accumulator.
+  auto ConvertedA = Builder.CreateIntrinsic(
+      V2I32x2Ty, Intrinsic::zluda_amatrix_convert_fp8_amd16x16_nv16x32, {A});
+  auto ConvertedB = Builder.CreateIntrinsic(
+      V2I32x2Ty, Intrinsic::zluda_bmatrix_convert_fp8_amd16x16_nv32x8,
+      {FirstB, SecondB});
+
+  auto CombinedC = combineCFp8(Builder, FirstC, SecondC);
+  auto A0 = Builder.CreateExtractValue(ConvertedA, {0});
+  auto A1 = Builder.CreateExtractValue(ConvertedA, {1});
+  auto B0 = Builder.CreateExtractValue(ConvertedB, {0});
+  auto B1 = Builder.CreateExtractValue(ConvertedB, {1});
+  auto CombinedCFloat = Builder.CreateBitCast(CombinedC, V8F32Ty);
+
+  auto TempD = Builder.CreateIntrinsic(
+      V8F32Ty, Intrinsic::amdgcn_wmma_f32_16x16x16_fp8_fp8,
+      {A0, B0, CombinedCFloat});
+  auto D = Builder.CreateIntrinsic(
+      V8F32Ty, Intrinsic::amdgcn_wmma_f32_16x16x16_fp8_fp8, {A1, B1, TempD});
+  auto DInt = Builder.CreateBitCast(D, V8I32Ty);
+  return Builder.CreateIntrinsic(
+      V4I32x2Ty, Intrinsic::zluda_dmatrix_split_fp8_nv16x8_amd16x16, {DInt});
+}
+
 // Lower an NVIDIA-style 16x8 MMA instruction to an AMD-style 16x16 MMA
 // instruction. The unused part of the matrix is filled with zeroes.
 void MMACombiner::lowerMMA(IntrinsicInst *MMA) {
@@ -822,6 +928,12 @@ void MMACombiner::lowerMMA(IntrinsicInst *MMA) {
     auto CPadding = Constant::getNullValue(C->getType());
     llvm::Value *DoubleResult =
         EmitAmdMmaI8(Builder, A, B, BPadding, C, CPadding);
+    Result = Builder.CreateExtractValue(DoubleResult, 0);
+  } else if (IID == Intrinsic::zluda_mma_m16n8k32_f32_fp8_fp8_f32) {
+    auto BPadding = Constant::getNullValue(B->getType());
+    auto CPadding = Constant::getNullValue(C->getType());
+    llvm::Value *DoubleResult =
+        EmitAmdMmaFp8(Builder, A, B, BPadding, C, CPadding);
     Result = Builder.CreateExtractValue(DoubleResult, 0);
   } else {
     llvm_unreachable("Unsupported MMA intrinsic");
@@ -1001,6 +1113,11 @@ bool MMACombiner::combineBB(BasicBlock &BB) {
     auto *S8MMA = getS8ZludaMMA(I);
     if (S8MMA) {
       MMAs.push_back(S8MMA);
+      continue;
+    }
+    auto *Fp8MMA = getFp8ZludaMMA(I);
+    if (Fp8MMA) {
+      MMAs.push_back(Fp8MMA);
       continue;
     }
   }
