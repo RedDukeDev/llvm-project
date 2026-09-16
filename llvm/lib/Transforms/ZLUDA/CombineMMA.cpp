@@ -10,8 +10,10 @@
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 
 using namespace llvm;
@@ -100,8 +102,14 @@ static void noteBlocker(const Instruction &I) {
 //
 // Takes plain instructions rather than intrinsics: pairMMAWrappers asks the
 // same question about two calls that combineMMA asks about two multiplies.
-static bool tryToReorderOperands(Instruction *FromBefore,
-                                 Instruction *ToBefore) {
+//
+// SkipOperand exempts one operand of FromBefore from the walk. A chained group
+// needs exactly that: the accumulator of its later multiplies is the result of
+// its earlier ones, which is about to be satisfied inside the group's own body
+// and so does not have to be computable out here. Without the exemption the
+// answer is always no, since that operand is one of the calls being replaced.
+static bool tryToReorderOperands(Instruction *FromBefore, Instruction *ToBefore,
+                                 int SkipOperand = -1) {
   assert(FromBefore->getParent() == ToBefore->getParent());
 
   SmallPtrSet<Instruction *, 16> InstructionsToMove;
@@ -110,7 +118,11 @@ static bool tryToReorderOperands(Instruction *FromBefore,
   Worklist.emplace_back(FromBefore);
   while (!Worklist.empty()) {
     Instruction *I = Worklist.pop_back_val();
-    for (Value *Operand : I->operands()) {
+    for (unsigned OpIdx = 0, OpEnd = I->getNumOperands(); OpIdx < OpEnd; ++OpIdx) {
+      if (I == FromBefore && (int)OpIdx == SkipOperand) {
+        continue;
+      }
+      Value *Operand = I->getOperand(OpIdx);
       auto *Dependency = dyn_cast<Instruction>(Operand);
       if (!Dependency || Dependency->getOpcode() == Instruction::PHI) {
         continue;
@@ -424,6 +436,47 @@ static bool mmaPairRequested() {
   return on;
 }
 
+// Whether to group a chain into one body rather than group strictly by A.
+//
+// The accumulator is the expensive matrix, measured: on the generic target,
+// dropping the cross-lane traffic of the accumulator on the way in is 14.5% of
+// the hot kernel and of the result on the way out 22.1%, while A and B together
+// do not measure at all. Every multiply pays both today.
+//
+// A chain does not have to: where one pair's two results are the next pair's
+// two accumulators, the split that leaves AMD layout and the concatenate that
+// re-enters it cancel, and combineC already knows how to cancel them -- it just
+// never sees both, because the two pairs sit in different group functions. In
+// the hot kernel that is 32 of the 128 pairs, all of them inside one basic
+// block.
+//
+// The cost is one A conversion: a chained group carries two distinct A operands
+// where an A-grouped one carries a single shared one. A is the matrix that does
+// not measure, so the trade is worth making.
+//
+// On by default, measured on gfx11-generic. In the IR the fold is visible as
+// exactly one round trip gone per chained body: 704 permlanes become 640, which
+// is the 32 of a concatenate plus the 32 of a split, with ds_bpermute and the
+// WMMA count untouched. On the clock, the hot kernel goes 84.7 -> 75.8 ms with
+// no run of one variant overlapping the other, and the whole network 379 ->
+// 368.5 ms (-2.8%), where 14 of 16 chained runs beat every plain run. The
+// output image is bit-identical in every run, as an exact cancellation
+// requires, and the translated network comes out 247 KB smaller.
+//
+// It reaches only the generic targets: on a native tier the selective fusion
+// opens the wrappers and pairMMAWrappers stands down, so there is nothing here
+// to group.
+static bool mmaChainRequested() {
+  static const bool on = [] {
+    const char *Value = ::getenv("ZLUDA_MMA_CHAIN");
+    return !Value || ::strcmp(Value, "0") != 0;
+  }();
+  return on;
+}
+
+// Chained groups built, reported with the rest.
+static unsigned ChainGroups = 0;
+
 // How many multiplies one group function takes.
 //
 // The hot kernel's 512 calls fall into only 80 groups sharing an A operand.
@@ -446,29 +499,45 @@ static unsigned mmaPairWidth() {
   return N;
 }
 
-// Builds {D1..DN} f(A, B1, C1, ..., BN, CN), with every multiply inlined into
-// it so the fusion that runs on it afterwards sees them as intrinsics.
-static Function *buildGroupFunction(Function *Wrapper, unsigned Width) {
+// One multiply inside a group function: which of the group's A operands it
+// takes, and where its accumulator comes from.
+struct GroupSlot {
+  unsigned AIndex = 0; // index into the group's A parameters
+  int CFromSlot = -1;  // -1: C is a parameter; otherwise that slot's result
+};
+
+// Builds {D1..DN} f(A1..Am, then B and, where it is not satisfied internally,
+// C for each slot), with every multiply inlined into it so the fusion that runs
+// on it afterwards sees them as intrinsics.
+//
+// A slot whose accumulator comes from another slot is what makes a chain worth
+// grouping: inside one body the producer's split and the consumer's
+// concatenate meet, and combineC cancels the pair. Across two group calls they
+// never meet, which is why that round trip survives today.
+static Function *buildGroupFunction(Function *Wrapper, ArrayRef<GroupSlot> Slots,
+                                    unsigned NumA, const Twine &Suffix) {
   LLVMContext &Ctx = Wrapper->getContext();
   Type *ATy = Wrapper->getArg(0)->getType();
   Type *BTy = Wrapper->getArg(1)->getType();
   Type *CTy = Wrapper->getArg(2)->getType();
   Type *RetTy = Wrapper->getReturnType();
+  const unsigned Width = (unsigned)Slots.size();
 
   SmallVector<Type *> Returns(Width, RetTy);
   StructType *GroupTy = StructType::get(Ctx, Returns);
 
-  SmallVector<Type *> Params;
-  Params.push_back(ATy); // shared, which is the entire point
-  for (unsigned I = 0; I < Width; ++I) {
+  SmallVector<Type *> Params(NumA, ATy);
+  for (const GroupSlot &Slot : Slots) {
     Params.push_back(BTy);
-    Params.push_back(CTy);
+    if (Slot.CFromSlot < 0) {
+      Params.push_back(CTy);
+    }
   }
 
   FunctionType *FT = FunctionType::get(GroupTy, Params, /*isVarArg=*/false);
-  Function *F = Function::Create(
-      FT, GlobalValue::InternalLinkage,
-      Wrapper->getName() + ".group" + Twine(Width), Wrapper->getParent());
+  Function *F = Function::Create(FT, GlobalValue::InternalLinkage,
+                                 Wrapper->getName() + ".group" + Suffix,
+                                 Wrapper->getParent());
   // Convergent because what it wraps is: the multiply and the lane exchanges
   // around it are wave-wide operations. noinline is the whole point.
   F->addFnAttr(Attribute::Convergent);
@@ -479,9 +548,15 @@ static Function *buildGroupFunction(Function *Wrapper, unsigned Width) {
   IRBuilder<> Builder(BB);
 
   SmallVector<CallInst *> Calls;
-  for (unsigned I = 0; I < Width; ++I) {
-    CallInst *Call = Builder.CreateCall(
-        Wrapper, {F->getArg(0), F->getArg(1 + 2 * I), F->getArg(2 + 2 * I)});
+  unsigned NextParam = NumA;
+  for (const GroupSlot &Slot : Slots) {
+    Value *B = F->getArg(NextParam++);
+    // A slot can only take its accumulator from an earlier one, which the
+    // grouping guarantees by building producers before consumers.
+    Value *C = Slot.CFromSlot < 0 ? (Value *)F->getArg(NextParam++)
+                                  : (Value *)Calls[Slot.CFromSlot];
+    CallInst *Call =
+        Builder.CreateCall(Wrapper, {F->getArg(Slot.AIndex), B, C});
     Call->setCallingConv(Wrapper->getCallingConv());
     Calls.push_back(Call);
   }
@@ -527,7 +602,8 @@ struct CombineStats {
            << " alone in their block; refusals: " << RefusedByDependency
            << " dependency, " << RefusedByMemory << " memory; "
            << "first blocker: " << FirstBlocker << "; " << Opened
-           << " wrappers opened; " << PairsBuilt << " group calls built\n";
+           << " wrappers opened; " << PairsBuilt << " group calls built ("
+           << ChainGroups << " of them chained)\n";
   }
 };
 } // namespace
@@ -989,6 +1065,10 @@ bool MMACombiner::pairMMAWrappers(BasicBlock &BB) {
   }
 
   MapVector<std::pair<Function *, Value *>, SmallVector<CallInst *, 4>> Groups;
+  // Which wrapper call takes another one's result as its accumulator. Built
+  // over the same scan, since a chain is visible here and nowhere later: once
+  // the calls are inside group functions the relation is gone.
+  DenseMap<CallInst *, CallInst *> ConsumerOf;
   for (Instruction &I : BB) {
     auto *Call = dyn_cast<CallInst>(&I);
     if (!Call || Call->arg_size() != 3) {
@@ -999,11 +1079,114 @@ bool MMACombiner::pairMMAWrappers(BasicBlock &BB) {
       continue;
     }
     Groups[{Callee, Call->getArgOperand(0)}].push_back(Call);
+    if (auto *Producer = dyn_cast<CallInst>(Call->getArgOperand(2))) {
+      if (Producer->getParent() == &BB && isMMAWrapper(Producer->getCalledFunction())) {
+        // One consumer per producer is all this looks for: a result read twice
+        // is not a chain that can be kept in AMD layout.
+        if (!ConsumerOf.count(Producer)) {
+          ConsumerOf[Producer] = Call;
+        } else {
+          ConsumerOf[Producer] = nullptr;
+        }
+      }
+    }
   }
 
-  // One group function per wrapper and width, not one per group.
-  DenseMap<std::pair<Function *, unsigned>, Function *> PairFunctions;
+  // One group function per wrapper and shape, not one per group.
+  std::map<std::string, Function *> PairFunctions;
   bool Modified = false;
+  // Calls already spoken for by a chained group, which the plain grouping below
+  // must then leave alone.
+  SmallPtrSet<CallInst *, 32> Taken;
+
+  if (mmaChainRequested()) {
+    // A pair whose two results are the next pair's two accumulators. Those four
+    // calls in one body are what lets combineC cancel the split and the
+    // concatenate between them.
+    for (auto &Group : Groups) {
+      SmallVectorImpl<CallInst *> &Calls = Group.second;
+      Function *Wrapper = Group.first.first;
+      for (size_t i = 0; i + 1 < Calls.size(); i += 2) {
+        CallInst *X1 = Calls[i], *X2 = Calls[i + 1];
+        if (Taken.count(X1) || Taken.count(X2)) {
+          continue;
+        }
+        CallInst *Y1 = ConsumerOf.lookup(X1), *Y2 = ConsumerOf.lookup(X2);
+        if (!Y1 || !Y2 || Y1 == Y2 || Taken.count(Y1) || Taken.count(Y2)) {
+          continue;
+        }
+        // The two consumers have to be a pair themselves, or nothing cancels:
+        // the fold wants both halves of one split.
+        if (Y1->getArgOperand(0) != Y2->getArgOperand(0) ||
+            Y1->getCalledFunction() != Wrapper || Y2->getCalledFunction() != Wrapper) {
+          continue;
+        }
+        CallInst *First = X1;
+        // The accumulator of a consumer is exempt (operand 2): the group's own
+        // body will supply it. Everything else still has to be computable where
+        // the single call replacing all four is about to go.
+        bool Reordered =
+            First->comesBefore(X2) && tryToReorderOperands(X2, First) &&
+            First->comesBefore(Y1) && tryToReorderOperands(Y1, First, 2) &&
+            First->comesBefore(Y2) && tryToReorderOperands(Y2, First, 2);
+        if (!Reordered) {
+          continue;
+        }
+
+        const GroupSlot Slots[4] = {{0, -1}, {0, -1}, {1, 0}, {1, 1}};
+        // Keyed by the wrapper too: one function holds both an f16 and an fp8
+        // wrapper when the kernel uses both, and a group built for one is the
+        // wrong shape for the other.
+        Function *&ChainF = PairFunctions[Wrapper->getName().str() + "|chain4"];
+        if (!ChainF) {
+          ChainF = buildGroupFunction(Wrapper, Slots, /*NumA=*/2, "chain4");
+          if (!ChainF) {
+            continue;
+          }
+          // The pass will not visit a function created while it is running.
+          MMACombiner Inner;
+          Inner.combine(*ChainF);
+        }
+
+        IRBuilder<> Builder(First);
+        CallInst *Members[4] = {X1, X2, Y1, Y2};
+        SmallVector<Value *> Args;
+        Args.push_back(X1->getArgOperand(0)); // A of the producing pair
+        Args.push_back(Y1->getArgOperand(0)); // A of the consuming pair
+        for (unsigned J = 0; J < 4; ++J) {
+          Args.push_back(Members[J]->getArgOperand(1));
+          if (Slots[J].CFromSlot < 0) {
+            Args.push_back(Members[J]->getArgOperand(2));
+          }
+        }
+        CallInst *ChainCall = Builder.CreateCall(ChainF, Args);
+        ChainCall->setCallingConv(ChainF->getCallingConv());
+
+        SmallVector<Value *> Results;
+        for (unsigned J = 0; J < 4; ++J) {
+          Results.push_back(Builder.CreateExtractValue(ChainCall, {J}));
+        }
+        for (unsigned J = 0; J < 4; ++J) {
+          Members[J]->replaceAllUsesWith(Results[J]);
+          Taken.insert(Members[J]);
+        }
+        for (unsigned J = 4; J-- > 0;) {
+          Members[J]->eraseFromParent();
+        }
+        ChainGroups++;
+        PairsBuilt++;
+        Modified = true;
+      }
+    }
+    // The calls that went into a chained group are gone from the block; drop
+    // them from the groups the plain path is about to walk.
+    for (auto &Group : Groups) {
+      SmallVectorImpl<CallInst *> &Calls = Group.second;
+      Calls.erase(std::remove_if(Calls.begin(), Calls.end(),
+                                 [&](CallInst *C) { return Taken.count(C) != 0; }),
+                  Calls.end());
+    }
+  }
 
   for (auto &Group : Groups) {
     SmallVectorImpl<CallInst *> &Calls = Group.second;
@@ -1039,9 +1222,12 @@ bool MMACombiner::pairMMAWrappers(BasicBlock &BB) {
       Function *Wrapper = Group.first.first;
       // One function per wrapper and width, since the remainder is narrower
       // than the rest and needs a shape of its own.
-      Function *&PairF = PairFunctions[{Wrapper, Width}];
+      Function *&PairF =
+          PairFunctions[Wrapper->getName().str() + "|width" + std::to_string(Width)];
       if (!PairF) {
-        PairF = buildGroupFunction(Wrapper, Width);
+        SmallVector<GroupSlot> Slots(Width, GroupSlot{0, -1});
+        PairF = buildGroupFunction(Wrapper, Slots, /*NumA=*/1,
+                                   "width" + Twine(Width));
         if (!PairF) {
           ++i;
           continue;
