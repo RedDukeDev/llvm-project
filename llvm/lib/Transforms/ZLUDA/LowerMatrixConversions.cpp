@@ -193,13 +193,64 @@ static bool probeNoCrossLane() {
   return on;
 }
 
+// Which matrix's cross-lane traffic to drop, when only one is being measured.
+//
+// The probe above takes all of it at once, which says what the whole relayout
+// costs but not which of the four matrices is paying for it.
+// ZLUDA_PROBE_NO_CROSS_LANE_KIND=a|b|c|d drops one at a time: A and B are the
+// operands, C the accumulator on the way in, D the result on the way out. Each
+// conversion keeps every extract, select and insert it has today, so the
+// difference is that matrix's lane traffic and nothing else.
+static char probeSkipKind() {
+  static const char kind = [] {
+    const char *value = ::getenv("ZLUDA_PROBE_NO_CROSS_LANE_KIND");
+    return value && value[0] ? value[0] : '\0';
+  }();
+  return kind;
+}
+
+// Which conversion is being lowered right now. Set once per conversion in
+// lowerConversion, read by the probe above.
+static char CurrentKind = '\0';
+
+// Whether this lane move should be dropped rather than emitted.
+static bool dropCrossLane() {
+  if (probeNoCrossLane())
+    return true;
+  const char kind = probeSkipKind();
+  return kind != '\0' && kind == CurrentKind;
+}
+
+// Which matrix an intrinsic belongs to, for the probe.
+static char kindOfConversion(Intrinsic::ID ID) {
+  switch (ID) {
+  case Intrinsic::zluda_amatrix_convert_amd_nv16x16:
+  case Intrinsic::zluda_amatrix_split_amd16x16_nv16x32:
+  case Intrinsic::zluda_amatrix_convert_fp8_amd16x16_nv16x32:
+    return 'a';
+  case Intrinsic::zluda_bmatrix_concatenate_amd16x16_nv16x8:
+  case Intrinsic::zluda_bmatrix_reshape_amd16x16_nv32x8:
+  case Intrinsic::zluda_bmatrix_convert_fp8_amd16x16_nv32x8:
+    return 'b';
+  case Intrinsic::zluda_cmatrix_concatenate_amd16x16_nv16x8:
+  case Intrinsic::zluda_cmatrix_concatenate_fp8_amd16x16_nv16x8:
+    return 'c';
+  case Intrinsic::zluda_dmatrix_split_nv16x8_amd16x16:
+  case Intrinsic::zluda_dmatrix_trunc_nv16x8_amd16x16:
+  case Intrinsic::zluda_dmatrix_split_fp8_nv16x8_amd16x16:
+    return 'd';
+  default:
+    return '\0';
+  }
+}
+
 static Value *bpermuteLane(IRBuilder<> &Builder, Value *Lane, Value *X,
                            const Twine &Name = "") {
   if (auto *C = dyn_cast<Constant>(X)) {
     return C;
   }
 
-  if (probeNoCrossLane()) {
+  if (dropCrossLane()) {
     return X;
   }
 
@@ -357,7 +408,7 @@ Value *LowerMatrixConversions::laneCondition(uint32_t Mask) {
 Value *LowerMatrixConversions::permuteLane(IRBuilder<> &Builder,
                                            Value *SrcLane, Value *X,
                                            const Twine &Name) {
-  if (isa<Constant>(X) || probeNoCrossLane() || !permlaneRequested())
+  if (isa<Constant>(X) || dropCrossLane() || !permlaneRequested())
     return bpermuteLane(Builder, SrcLane, X, Name);
 
   // The map this gather follows, lane by lane.
@@ -969,6 +1020,7 @@ Value *LowerMatrixConversions::dMatrixSplitFp8(IRBuilder<> &Builder,
 
 void LowerMatrixConversions::lowerConversion(IntrinsicInst *Conversion) {
   IRBuilder<> Builder(Conversion);
+  CurrentKind = kindOfConversion(Conversion->getIntrinsicID());
 
   switch (Conversion->getIntrinsicID()) {
   case Intrinsic::zluda_amatrix_convert_amd_nv16x16:
